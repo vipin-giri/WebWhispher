@@ -1,313 +1,385 @@
 #!/usr/bin/env python3
 """
-WebWhisper – Fully working Flask tool
-- Modern UI
-- Auto-save scan results to TXT files
-- Unique domains stored in SQLite
-- Export DB to TXT
-Run:
-    pip install flask requests
-    python webwhisper_app.py
-Open:
-    http://127.0.0.1:5000
+WebWhisper - Domain Discovery Tool
+
+Fetch random real domains (unique across runs) using Certificate Transparency (crt.sh).
+Persists 'seen' domains in a local SQLite DB so each scan returns new domains only.
+Filters for live domains with HTTP 200 status.
+
+Usage:
+    python scanner.py --count 20 --tlds com,net
+    python scanner.py --count 100 --no-verify  (skip live checking)
+
+Notes:
+- Be polite to crt.sh (this script has basic rate-limiting and caching).
+- If crt.sh is unreachable, the script will try to use cached domains only.
 """
 
-from flask import Flask, request, g, redirect, url_for, render_template_string, send_file, flash
-import sqlite3, requests, hashlib, random, time, io, os, datetime
+import argparse
+import requests
+import sqlite3
+import time
+import random
+import hashlib
+import sys
+from datetime import datetime
 from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
 
-# ------------------ CONFIG ------------------
-DB_PATH = "webwhisper_domains.db"
-CRT_SH_BASE = "https://crt.sh/"
-USER_AGENT = "WebWhisper/1.0 (local)"
-REQUEST_TIMEOUT = 20
-REQUEST_DELAY = 0.7
-MAX_FETCH = 1200
-DEFAULT_TLDS = ["com", "net", "org"]
+# Disable SSL warnings for domains with certificate issues
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
-_last_results = []
+# === COLORS ===
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
-ASCII_BANNER = r"""
- __      __      ___.   __      __.__    .__                             
-/  \    /  \ ____\_ |__/  \    /  \  |__ |__| ____________   ___________  
-\   \/\/   // __ \| __ \   \/\/   /  |  \|  |/  ___/\__  \_/ __ \_  __ \ 
- \        /\  ___/| \_\ \        /|   Y  \  |\___ \  / __ \\  ___/|  | \/ 
-  \__/\  /  \___  >___  /\__/\  / |___|  /__/____  >(____  /\___  >__|    
-       \/       \/    \/      \/       \/        \/      \/     \/        
+def print_banner():
+    banner = f"""
+{Colors.RED}{Colors.BOLD}
+ ██╗    ██╗███████╗██████╗ ██╗    ██╗██╗  ██╗██╗███████╗██████╗ ███████╗██████╗ 
+ ██║    ██║██╔════╝██╔══██╗██║    ██║██║  ██║██║██╔════╝██╔══██╗██╔════╝██╔══██╗
+ ██║ █╗ ██║█████╗  ██████╔╝██║ █╗ ██║███████║██║███████╗██████╔╝█████╗  ██████╔╝
+ ██║███╗██║██╔══╝  ██╔══██╗██║███╗██║██╔══██║██║╚════██║██╔═══╝ ██╔══╝  ██╔══██╗
+ ╚███╔███╔╝███████╗██████╔╝╚███╔███╔╝██║  ██║██║███████║██║     ███████╗██║  ██║
+  ╚══╝╚══╝ ╚══════╝╚═════╝  ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚══════╝╚═╝  ╚═╝
+{Colors.ENDC}
+{Colors.YELLOW}              Domain Discovery via Certificate Transparency{Colors.ENDC}
+{Colors.BLUE}                        CIpher
 """
+    print(banner)
 
-# ------------------ DB ------------------
-def get_db():
-    db = getattr(g, "_db", None)
-    if db is None:
-        db = g._db = sqlite3.connect(DB_PATH, check_same_thread=False)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS seen_domains (
-                id INTEGER PRIMARY KEY,
-                domain TEXT UNIQUE,
-                fingerprint TEXT UNIQUE,
-                first_seen TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        db.commit()
-    return db
+# === CONFIG ===
+DB_PATH = "webwhisper_db.db"
+CRT_SH_BASE = "https://crt.sh/"
+USER_AGENT = "WebWhisper/1.0 (+https://example.local)"
+REQUEST_TIMEOUT = 20
+SLEEP_BETWEEN_REQUESTS = 1.0  # polite delay
+DEFAULT_TLDS = ["com", "net", "org", "io", "co", "uk", "de", "fr", "ca", "au", "jp", "cn", "in", "br", "ru", "nl", "it", "es", "se", "no", "pl", "be", "ch", "at", "dk", "fi", "cz", "pt", "gr", "nz"]
+MAX_RESULTS_FETCH = 3000  # safety cap on how many JSON entries we'll ingest per TLD request
+LIVE_CHECK_TIMEOUT = 5  # timeout for checking if domain is live
+MAX_WORKERS = 20  # concurrent threads for live checking
 
-@app.teardown_appcontext
-def close_db(_):
-    db = getattr(g, "_db", None)
-    if db: db.close()
+# === DB ===
+def init_db(path=DB_PATH):
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS seen_domains (
+            id INTEGER PRIMARY KEY,
+            domain TEXT UNIQUE,
+            fingerprint TEXT UNIQUE,
+            first_seen_ts DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    return conn
 
-def sha(domain): return hashlib.sha256(domain.encode()).hexdigest()
-
-def seen(domain):
-    db = get_db()
-    fp = sha(domain)
-    cur = db.cursor()
-    cur.execute("SELECT 1 FROM seen_domains WHERE fingerprint=? LIMIT 1", (fp,))
-    return cur.fetchone() is not None
-
-def mark(domain):
-    db = get_db()
-    fp = sha(domain)
+def mark_seen(conn, domain):
+    cur = conn.cursor()
+    fp = hashlib.sha256(domain.encode('utf-8')).hexdigest()
     try:
-        db.execute("INSERT INTO seen_domains(domain,fingerprint) VALUES(?,?)", (domain, fp))
-        db.commit()
+        cur.execute("INSERT INTO seen_domains (domain, fingerprint) VALUES (?, ?)", (domain, fp))
+        conn.commit()
         return True
-    except:
+    except Exception:
         return False
 
-def seen_count():
-    cur = get_db().cursor()
-    cur.execute("SELECT COUNT(*) FROM seen_domains")
-    return cur.fetchone()[0]
+def already_seen(conn, domain):
+    cur = conn.cursor()
+    fp = hashlib.sha256(domain.encode('utf-8')).hexdigest()
+    cur.execute("SELECT 1 FROM seen_domains WHERE fingerprint = ? LIMIT 1", (fp,))
+    return cur.fetchone() is not None
 
-def sample_db(n):
-    cur = get_db().cursor()
-    cur.execute("SELECT domain FROM seen_domains ORDER BY RANDOM() LIMIT ?", (n,))
-    return [r[0] for r in cur.fetchall()]
+# === Live domain checking ===
+def check_domain_live(domain):
+    """
+    Check if domain is live by attempting HTTP/HTTPS connections.
+    Returns (domain, True) if status 200, else (domain, False)
+    """
+    protocols = ['https://', 'http://']
+    headers = {'User-Agent': USER_AGENT}
+    
+    for protocol in protocols:
+        try:
+            url = f"{protocol}{domain}"
+            response = requests.get(
+                url, 
+                headers=headers, 
+                timeout=LIVE_CHECK_TIMEOUT, 
+                allow_redirects=True,
+                verify=False  # Skip SSL verification for domains with cert issues
+            )
+            if response.status_code == 200:
+                return (domain, True, response.status_code, protocol)
+        except requests.exceptions.SSLError:
+            # Try with verify=False already set, continue to next protocol
+            continue
+        except requests.exceptions.ConnectionError:
+            continue
+        except requests.exceptions.Timeout:
+            continue
+        except requests.exceptions.TooManyRedirects:
+            continue
+        except Exception:
+            continue
+    
+    return (domain, False, None, None)
 
-# ------------------ CRT.SH FETCH ------------------
-def fetch_tld(tld, limit=MAX_FETCH):
+def filter_live_domains(domains, show_progress=True):
+    """
+    Filter domains to only return those with HTTP 200 status.
+    Uses ThreadPoolExecutor for concurrent checking.
+    """
+    live_domains = []
+    total = len(domains)
+    checked = 0
+    
+    if show_progress:
+        print(f"{Colors.CYAN}[*] Checking {total} domains for live status (HTTP 200)...{Colors.ENDC}")
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_domain = {executor.submit(check_domain_live, domain): domain for domain in domains}
+        
+        for future in as_completed(future_to_domain):
+            checked += 1
+            try:
+                domain, is_live, status, protocol = future.result()
+                if is_live:
+                    live_domains.append(domain)
+                    if show_progress:
+                        print(f"{Colors.GREEN}[✓] {domain} ({protocol[:-3].upper()}) - {checked}/{total}{Colors.ENDC}")
+                else:
+                    if show_progress:
+                        print(f"{Colors.RED}[✗] {domain} - {checked}/{total}{Colors.ENDC}", end='\r')
+            except Exception as e:
+                if show_progress:
+                    print(f"{Colors.RED}[✗] Error checking domain - {checked}/{total}{Colors.ENDC}", end='\r')
+    
+    if show_progress:
+        print(f"\n{Colors.GREEN}[+] Found {len(live_domains)} live domains out of {total} checked{Colors.ENDC}")
+    
+    return live_domains
+
+# === crt.sh fetch/parsing ===
+def fetch_from_crtsh(tld="com"):
+    """
+    Fetch JSON results from crt.sh searching for '%.<tld>' – returns a set of domains.
+    crt.sh JSON fields: 'issuer_ca_id','issuer_name','common_name','name_value' etc.
+    We'll parse name_value which can contain multiple domains separated by newline.
+    """
     q = quote_plus(f"%.{tld}")
     url = f"{CRT_SH_BASE}?q={q}&output=json"
+    headers = {"User-Agent": USER_AGENT}
     try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
-        time.sleep(REQUEST_DELAY)
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        if r.status_code != 200:
+            # some deployments redirect to HTML if too many results; treat non-200 as failure
+            print(f"{Colors.RED}[!] crt.sh returned status {r.status_code} for tld {tld}{Colors.ENDC}", file=sys.stderr)
+            return set()
         data = r.json()
-    except:
-        return set(), "fetch failed"
+    except ValueError:
+        # invalid json or HTML returned
+        print(f"{Colors.RED}[!] crt.sh returned non-JSON reply for tld {tld} – skipping.{Colors.ENDC}", file=sys.stderr)
+        return set()
+    except Exception as e:
+        print(f"{Colors.RED}[!] Error fetching crt.sh for tld {tld}: {e}{Colors.ENDC}", file=sys.stderr)
+        return set()
 
     domains = set()
+    # data is a list of objects – 'name_value' contains domain(s), possibly with wildcards or newlines
     for i, entry in enumerate(data):
-        if i >= limit: break
-        nv = entry.get("name_value", "")
+        if i >= MAX_RESULTS_FETCH:
+            break
+        nv = entry.get("name_value")
+        if not nv:
+            continue
+        # entries can contain multiple names separated by newline
         for name in nv.splitlines():
             name = name.strip().lower()
-            if name.startswith("*."): name = name[2:]
-            if "." not in name: continue
+            if not name:
+                continue
+            # strip leading wildcard if present
+            if name.startswith("*."):
+                name = name[2:]
+            # filter out IPs and short junk
+            if name.count(".") < 1:
+                continue
             domains.add(name)
+    return domains
 
-    return domains, None
-
-# ------------------ TEMPLATES ------------------
-HTML = """
-<!doctype html>
-<html>
-<head>
-<title>WebWhisper</title>
-<style>
-body{background:#0a0f1c;color:#e6eef8;font-family:Arial;padding:20px;}
-.card{background:#11182b;padding:18px;border-radius:8px;margin-bottom:20px;}
-input,button,textarea{padding:8px;border-radius:6px;border:1px solid #2a3550;background:#0d1422;color:#e6eef8;}
-button{cursor:pointer;background:#3bb9ff;color:#000;font-weight:bold;border:0;}
-textarea{width:100%;height:200px;}
-.muted{color:#8fa3c8;font-size:13px;}
-</style>
-</head>
-<body>
-
-<div class="card">
-<pre>{{ banner }}</pre>
-<h2>WebWhisper</h2>
-<div class="muted">Unique domain finder (crt.sh). DB size: <b>{{ seen_count }}</b></div>
-</div>
-
-<div class="card">
-<h3>Run Scan</h3>
-<form method="POST" action="/scan">
-<label>Count:</label><br>
-<input type="number" name="count" value="25"><br><br>
-
-<label>TLDs:</label><br>
-<input type="text" name="tlds" value="com,net,org"><br><br>
-
-<label>Max per TLD:</label><br>
-<input type="number" name="max_fetch" value="1200"><br><br>
-
-<button type="submit">Run Scan</button>
-</form>
-</div>
-
-{% if results %}
-<div class="card">
-<h3>Results ({{ results|length }})</h3>
-<textarea readonly>{{ results_text }}</textarea><br><br>
-
-<form method="POST" action="/download_results">
-<input type="hidden" name="results_text" value="{{ results_text }}">
-<button>Download This Scan (.txt)</button>
-</form>
-</div>
-{% endif %}
-
-<div class="card">
-<h3>Actions</h3>
-<form method="POST" action="/download_last_results">
-<button>Download Last Scan (.txt)</button>
-</form>
-<br>
-<a href="/export_txt"><button>Export DB (.txt)</button></a>
-<br><br>
-<a href="/sample_page"><button>Sample DB</button></a>
-</div>
-
-</body>
-</html>
-"""
-
-SAMPLE_HTML = """
-<!doctype html>
-<html>
-<head>
-<title>Sample DB</title>
-<style>
-body{background:#0a0f1c;color:#e6eef8;font-family:Arial;padding:20px;}
-.card{background:#11182b;padding:18px;border-radius:8px;margin-bottom:20px;}
-input,button,textarea{padding:8px;border-radius:6px;border:1px solid #2a3550;background:#0d1422;color:#e6eef8;}
-textarea{width:100%;height:200px;}
-button{cursor:pointer;background:#3bb9ff;color:#000;font-weight:bold;border:0;}
-</style>
-</head>
-<body>
-
-<div class="card">
-<h2>Sample DB</h2>
-<form method="POST" action="/sample">
-<input type="number" name="count" value="25">
-<button>Sample</button>
-</form>
-</div>
-
-{% if results %}
-<div class="card">
-<h3>Results</h3>
-<textarea readonly>{{ results_text }}</textarea><br><br>
-
-<form method="POST" action="/download_results">
-<input type="hidden" name="results_text" value="{{ results_text }}">
-<button>Download (.txt)</button>
-</form>
-</div>
-{% endif %}
-
-<a href="/">Back</a>
-
-</body>
-</html>
-"""
-
-# ------------------ ROUTES ------------------
-@app.route("/")
-def home():
-    return render_template_string(
-        HTML, banner=ASCII_BANNER, seen_count=seen_count(), results=None
-    )
-
-@app.route("/scan", methods=["POST"])
-def scan():
-    global _last_results
-
-    count = int(request.form.get("count", 25))
-    tlds = [t.strip() for t in request.form.get("tlds", "com,net,org").split(",")]
-    max_fetch = int(request.form.get("max_fetch", MAX_FETCH))
-
+# === Main logic ===
+def collect_candidates(tlds):
+    """Try crt.sh for each tld; build a candidate pool (deduped)."""
     pool = set()
-    for t in tlds:
-        d, _ = fetch_tld(t, max_fetch)
-        pool.update(d)
+    print(f"{Colors.CYAN}[*] Gathering candidate domains from crt.sh (may take a few seconds)...{Colors.ENDC}")
+    for tld in tlds:
+        print(f"{Colors.BLUE}    -> fetching .{tld} ...{Colors.ENDC}", end="", flush=True)
+        try:
+            found = fetch_from_crtsh(tld)
+            print(f"{Colors.GREEN} {len(found)}{Colors.ENDC}")
+            pool.update(found)
+        except Exception as e:
+            print(f"{Colors.RED} error: {e}{Colors.ENDC}")
+    print(f"{Colors.CYAN}[*] Total unique candidates fetched: {Colors.GREEN}{len(pool)}{Colors.ENDC}")
+    return pool
 
-    pool = list(pool)
-    random.shuffle(pool)
+def sample_new_domains(conn, candidates, count, verify_live=True):
+    """Return up to `count` domains from candidates that are not already in DB; mark and return them."""
+    candidates_list = list(candidates)
+    random.shuffle(candidates_list)
+    
+    # We'll collect more than needed to account for offline domains
+    # Reduced multiplier: 3x instead of 10x for faster processing
+    fetch_multiplier = 3 if verify_live else 1
+    fetch_count = count * fetch_multiplier
+    
+    potential = []
+    for d in candidates_list:
+        if len(potential) >= fetch_count:
+            break
+        if already_seen(conn, d):
+            continue
+        # simple sanity filter: prefer domains without weird chars
+        if any(c in d for c in " <>\\\"'"):
+            continue
+        potential.append(d)
+    
+    # Filter for live domains if verification is enabled
+    if verify_live and potential:
+        live = filter_live_domains(potential)
+        # Mark as seen and return
+        out = []
+        for d in live:
+            if len(out) >= count:
+                break
+            success = mark_seen(conn, d)
+            if success:
+                out.append(d)
+        return out
+    else:
+        # No verification, just mark and return
+        out = []
+        for d in potential:
+            if len(out) >= count:
+                break
+            success = mark_seen(conn, d)
+            if success:
+                out.append(d)
+        return out
 
-    results = []
-    for domain in pool:
-        if len(results) >= count: break
-        if not seen(domain):
-            if mark(domain):
-                results.append(domain)
+def save_domains_to_file(domains):
+    """Auto-save domains to a file with timestamp."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{timestamp}_domains.txt"
+    try:
+        with open(filename, 'w') as f:
+            for domain in domains:
+                f.write(f"{domain}\n")
+        print(f"{Colors.GREEN}[+] Domains saved to: {Colors.BOLD}{filename}{Colors.ENDC}")
+        return filename
+    except Exception as e:
+        print(f"{Colors.RED}[!] Error saving to file: {e}{Colors.ENDC}")
+        return None
 
-    # fallback
-    if len(results) < count:
-        need = count - len(results)
-        results += sample_db(need)
+def main():
+    print_banner()
+    
+    ap = argparse.ArgumentParser(description="WebWhisper - Random real domains finder (unique per run).")
+    ap.add_argument("--count", "-n", type=int, default=25, help="how many unique live domains to return")
+    ap.add_argument("--tlds", type=str, default=",".join(DEFAULT_TLDS),
+                    help=f"comma-separated list of TLDs to query (default: {len(DEFAULT_TLDS)} common TLDs)")
+    ap.add_argument("--use-cache-only", action="store_true",
+                    help="don't fetch crt.sh; use DB cache only (useful if offline)")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="skip live domain verification (faster but may return offline domains)")
+    args = ap.parse_args()
 
-    _last_results = results[:]
+    tlds = [t.strip().lstrip(".") for t in args.tlds.split(",") if t.strip()]
+    verify_live = not args.no_verify
 
-    # -------- AUTO-SAVE --------
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"scan_{timestamp}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write("\n".join(results))
-    # ---------------------------
+    conn = init_db()
 
-    return render_template_string(
-        HTML,
-        banner=ASCII_BANNER,
-        seen_count=seen_count(),
-        results=results,
-        results_text="\n".join(results)
-    )
+    if verify_live:
+        print(f"{Colors.YELLOW}[*] Live verification: ENABLED (only HTTP 200 domains will be returned){Colors.ENDC}")
+    else:
+        print(f"{Colors.YELLOW}[*] Live verification: DISABLED (domains may be offline){Colors.ENDC}")
 
-@app.route("/sample_page")
-def sample_page():
-    return render_template_string(SAMPLE_HTML)
+    # If cache-only requested, collect unseen domains from DB by sampling rows not yet returned? We'll just read DB and say none left.
+    if args.use_cache_only:
+        print(f"{Colors.CYAN}[*] Using DB cache only (no remote fetch).{Colors.ENDC}")
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM seen_domains ORDER BY RANDOM() LIMIT ?", (args.count * 3 if verify_live else args.count,))
+        rows = cur.fetchall()
+        domains = [r[0] for r in rows]
+        if not domains:
+            print(f"{Colors.RED}[!] DB empty. Run once without --use-cache-only to populate cache.{Colors.ENDC}")
+        else:
+            if verify_live:
+                domains = filter_live_domains(domains)[:args.count]
+            for d in domains:
+                print(f"{Colors.GREEN}{d}{Colors.ENDC}")
+            save_domains_to_file(domains)
+        return
 
-@app.route("/sample", methods=["POST"])
-def sample():
-    global _last_results
-    count = int(request.form.get("count", 25))
-    results = sample_db(count)
-    _last_results = results[:]
-    return render_template_string(
-        SAMPLE_HTML,
-        results=results,
-        results_text="\n".join(results)
-    )
+    # Fetch candidate pool from crt.sh
+    candidates = collect_candidates(tlds)
 
-@app.route("/download_results", methods=["POST"])
-def download_results():
-    text = request.form.get("results_text", "")
-    bio = io.BytesIO(text.encode())
-    return send_file(bio, mimetype="text/plain", as_attachment=True, download_name="scan_results.txt")
+    if not candidates:
+        # Nothing fetched; try to return previously-seen domains that weren't printed before.
+        print(f"{Colors.YELLOW}[!] No new candidates fetched from crt.sh. Falling back to DB random selection.{Colors.ENDC}")
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM seen_domains ORDER BY RANDOM() LIMIT ?", (args.count * 3 if verify_live else args.count,))
+        rows = cur.fetchall()
+        domains = [r[0] for r in rows]
+        if rows:
+            if verify_live:
+                domains = filter_live_domains(domains)[:args.count]
+            for d in domains:
+                print(f"{Colors.GREEN}{d}{Colors.ENDC}")
+            save_domains_to_file(domains)
+        else:
+            print(f"{Colors.RED}[!] DB empty too. Try again later or disable --use-cache-only.{Colors.ENDC}")
+        return
 
-@app.route("/download_last_results", methods=["POST"])
-def download_last_results():
-    text = "\n".join(_last_results)
-    bio = io.BytesIO(text.encode())
-    return send_file(bio, mimetype="text/plain", as_attachment=True, download_name="last_scan.txt")
+    selected = sample_new_domains(conn, candidates, args.count, verify_live)
 
-@app.route("/export_txt")
-def export_txt():
-    cur = get_db().cursor()
-    cur.execute("SELECT domain FROM seen_domains ORDER BY first_seen")
-    rows = cur.fetchall()
-    text = "\n".join(r[0] for r in rows)
-    bio = io.BytesIO(text.encode())
-    return send_file(bio, mimetype="text/plain", as_attachment=True, download_name="webwhisper_db.txt")
+    # If we didn't find enough live domains, attempt to fetch more from DB
+    if len(selected) < args.count:
+        need = args.count - len(selected)
+        print(f"{Colors.YELLOW}[*] Only {len(selected)} new live domains available. Filling {need} from DB (already seen).{Colors.ENDC}")
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM seen_domains ORDER BY RANDOM() LIMIT ?", (need * 3 if verify_live else need,))
+        rows = cur.fetchall()
+        cached_domains = [r[0] for r in rows]
+        
+        if verify_live and cached_domains:
+            cached_live = filter_live_domains(cached_domains)
+            selected.extend(cached_live[:need])
+        else:
+            for r in rows[:need]:
+                selected.append(r[0])
 
-# ------------------ RUN ------------------
+    # Final output
+    print(f"\n{Colors.BOLD}{Colors.CYAN}[*] Discovered Live Domains:{Colors.ENDC}\n")
+    for d in selected:
+        print(f"{Colors.GREEN}{d}{Colors.ENDC}")
+    
+    # Auto-save to file
+    if selected:
+        print()
+        save_domains_to_file(selected)
+    else:
+        print(f"{Colors.RED}[!] No live domains found. Try increasing --count or adding more --tlds{Colors.ENDC}")
+
 if __name__ == "__main__":
-    print("WebWhisper running at http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    main()
