@@ -1,46 +1,46 @@
-# 🕵️‍♂️ WEBWHISPER
+# WEBWHISPER
 
 Advanced Domain Discovery Engine with live verification, automated deduplication, CT-log intelligence, colorful CLI, auto-saving, and real-time status checking.
 
 Designed for security researchers, OSINT analysts, and bug bounty hunters who need continuous unique domain discovery with live HTTP 200 verification.
 
-## 📸 Overview
+## Overview
 
 WebWhisper is a CT-log-powered domain discovery tool that fetches real, freshly-issued domains from Certificate Transparency logs (crt.sh) and verifies they're live with HTTP 200 responses.
 It guarantees zero duplicates, automatic saving, and instant live domain verification.
 
 ### Key Highlights:
 
-- ⚡ Fast real-time domain discovery (Certificate Transparency based)
-- ✅ Live domain verification (HTTP 200 status checking)
-- 🧠 Built-in deduplication with SQLite persistence
-- 📝 Auto-saves each scan to timestamped .txt files
-- 🎨 Beautiful colorized terminal output
-- 🌐 30+ default TLDs for comprehensive coverage
-- 🧪 Offline sampling mode from stored DB
-- 🚀 Multi-threaded live checking (20 concurrent threads)
-- 🎯 Perfect for reconnaissance, OSINT, and bug bounty hunting
+- Fast real-time domain discovery (Certificate Transparency based)
+- Live domain verification (HTTP 200 status checking)
+- Built-in deduplication with SQLite persistence
+- Auto-saves each scan to timestamped .txt files
+- Beautiful colorized terminal output
+- 30+ default TLDs for comprehensive coverage
+- Offline sampling mode from stored DB
+- Multi-threaded live checking (20 concurrent threads)
+- Perfect for reconnaissance, OSINT, and bug bounty hunting
 
-## ✨ Features
+##  Features
 
-- ✅ Fetch real domains from Certificate Transparency logs
-- 🔴 Verify domains are live with HTTP 200 status
-- 🔁 Never repeats a domain (SHA-256 deduplication)
-- 📂 Auto-save every scan to timestamped .txt files (YYYYMMDD_HHMMSS_domains.txt)
-- 🎨 Clean, colorized terminal interface with progress indicators
-- 📡 Multi-TLD scanning (30+ TLDs by default)
-- 🧰 Offline mode — sample DB without network
-- 🧼 Clean domain normalization (wildcard removal, lowercasing)
-- ⚡ Fast concurrent checking (20 parallel connections)
-- 🎚 Configurable max-fetch limits
-- 📊 Real-time progress display with ✓/✗ indicators
-- 🎛 Easy to extend for automation
+- Fetch real domains from Certificate Transparency logs
+- Verify domains are live with HTTP 200 status
+- Never repeats a domain (SHA-256 deduplication)
+- Auto-save every scan to timestamped .txt files (YYYYMMDD_HHMMSS_domains.txt)
+- Clean, colorized terminal interface with progress indicators
+- Multi-TLD scanning (30+ TLDs by default)
+- Offline mode — sample DB without network
+- Clean domain normalization (wildcard removal, lowercasing)
+- Fast concurrent checking (20 parallel connections)
+- Configurable max-fetch limits
+- Real-time progress display with ✓/✗ indicators
+- Easy to extend for automation
 
-## 🧱 Requirements
+##  Requirements
 
-- 🐍 Python 3.8+
-- 🌐 Internet connection (for CT log fetching and live verification)
-- 📦 Dependencies from requirements.txt
+-  Python 3.8+
+-  Internet connection (for CT log fetching and live verification)
+-  Dependencies from requirements.txt
 
 ### Dependencies:
 
@@ -49,28 +49,28 @@ requests==2.31.0
 urllib3==2.1.0
 ```
 
-## 📦 Installation
+##  Installation
 
-### 1️⃣ Download the script
+###  Download the script
 
 - `scanner.py`
 - `requirements.txt`
 
 Put both into the same folder.
 
-### 2️⃣ Install dependencies
+###  Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3️⃣ Make executable (optional)
+###  Make executable (optional)
 
 ```bash
 chmod +x scanner.py
 ```
 
-## 🚀 Usage
+##  Usage
 
 ### Basic usage (25 live domains with all default TLDs):
 
@@ -107,7 +107,7 @@ python scanner.py --count 1000 --no-verify
 ```bash
 python scanner.py --count 50 --use-cache-only
 ```
-## ⚙️ Command-Line Options
+##  Command-Line Options
 
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
@@ -119,7 +119,7 @@ python scanner.py --count 50 --use-cache-only
 ### Default TLDs (30 total):
 com, net, org, io, co, uk, de, fr, ca, au, jp, cn, in, br, ru, nl, it, es, se, no, pl, be, ch, at, dk, fi, cz, pt, gr, nz
 
-## 📂 File Output
+##  File Output
 
 **Auto-saved scan results:**
 - `20241209_154200_domains.txt`
@@ -129,7 +129,7 @@ com, net, org, io, co, uk, de, fr, ca, au, jp, cn, in, br, ru, nl, it, es, se, n
 **SQLite Database:**
 - `webwhisper_db.db` (stores all seen domains with SHA-256 fingerprints)
 
-## 🔍 How It Works
+##  How It Works
 
 1. **Fetch** - Queries crt.sh Certificate Transparency logs for specified TLDs
 2. **Deduplicate** - Checks SQLite DB to ensure domain hasn't been seen before
@@ -137,7 +137,7 @@ com, net, org, io, co, uk, de, fr, ca, au, jp, cn, in, br, ru, nl, it, es, se, n
 4. **Store** - Marks verified domains as seen in database
 5. **Save** - Auto-saves results to timestamped .txt file
 
-## 💡 Pro Tips
+## Pro Tips
 
 ### For maximum results:
 ```bash
@@ -159,13 +159,13 @@ python scanner.py --count 100 --use-cache-only
 rm webwhisper_db.db
 ```
 
-## 📊 Expected Results
+##  Expected Results
 
 - **Live verification enabled**: Typically 20-40% of domains return HTTP 200
 - **Processing speed**: ~20 domains/second with live checking
 - **Without verification**: Much faster, but may include offline domains
 
-## ⚠️ Important Notes
+##  Important Notes
 
 - **Rate limiting**: Script includes 1-second delay between crt.sh requests
 - **SSL verification**: Disabled for domains with certificate issues
@@ -173,9 +173,9 @@ rm webwhisper_db.db
 - **Concurrent threads**: 20 parallel connections for speed
 - **First run**: Slower as it builds the database cache
 
-## ⚖️ Legal & Ethical Use
+##  Legal & Ethical Use
 
-⚠️ **IMPORTANT:**
+ **IMPORTANT:**
 WebWhisper is designed for OSINT, research, and authorized reconnaissance ONLY.
 
 You must follow:
@@ -190,7 +190,7 @@ You must follow:
 
 Misuse is strictly discouraged and may be illegal.
 
-## 🤝 Contributing
+##  Contributing
 
 Contributions are welcome — improvements, features, optimizations, and bug fixes.
 
@@ -203,7 +203,7 @@ Areas for contribution:
 
 Submit pull requests or open GitHub issues.
 
-## 🐛 Troubleshooting
+##  Troubleshooting
 
 ### "No domains found"
 - Check internet connection
@@ -226,23 +226,23 @@ rm webwhisper_db.db
 python scanner.py --count 100
 ```
 
-## 🚨 Support
+##  Support
 
 For help, bug reports, or feature requests:
 - Open a GitHub issue
 - Contact the project maintainer
 
-## 🎯 Use Cases
+##  Use Cases
 
-- 🔍 Bug bounty reconnaissance
-- 🕵️ OSINT investigations
-- 🔐 Security research
-- 🌐 Domain monitoring
-- 📊 Threat intelligence gathering
-- 🎓 Educational purposes
-- 🤖 Automation pipelines
+-  Bug bounty reconnaissance
+-  OSINT investigations
+-  Security research
+-  Domain monitoring
+-  Threat intelligence gathering
+-  Educational purposes
+-  Automation pipelines
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - Certificate Transparency project
 - crt.sh for CT log access
@@ -250,13 +250,13 @@ For help, bug reports, or feature requests:
 
 ---
 
-## 📌 Version
+##  Version
 
 **WebWhisper v1.0.0**
 
 ---
 
-## ⚖️ License
+##  License
 
 MIT License © 2025
 
@@ -268,6 +268,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Use responsibly.
 
-**Made with ❤️ for the security research community**
+**Made with  for the security research community**
 
 *Happy hunting! 🎯*
